@@ -5,138 +5,288 @@
   <title>Patient Map</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
-  <!-- Leaflet + MarkerCluster (CDN) -->
+  <!-- Leaflet + MarkerCluster + PapaParse -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
-
-  <!-- PapaParse to read CSV in the browser -->
   <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
 
   <style>
     html, body, #map { height: 100%; margin: 0; }
-    .topbar {
+    .panel {
       position: absolute; z-index: 1000; left: 10px; top: 10px;
-      background: white; padding: 10px 12px; border-radius: 10px;
-      box-shadow: 0 4px 14px rgba(0,0,0,0.15); font: 14px/1.3 system-ui, sans-serif;
+      background: #fff; padding: 10px 12px; border-radius: 12px;
+      box-shadow: 0 6px 18px rgba(0,0,0,.15); font: 14px/1.35 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      max-width: 360px;
     }
-    .muted { color: #666; }
+    .muted { color:#666; }
+    .error { color:#b00020; font-weight:600; margin-top: 6px; }
+    .legend {
+      margin-top: 8px; display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center;
+      font-size: 13px;
+    }
+    .chip {
+      width: 14px; height: 14px; border-radius: 50%;
+      box-shadow: inset 0 0 0 1px rgba(0,0,0,.25);
+    }
+    .controls {
+      margin-top: 8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+    }
+    .btn {
+      appearance: none; border: 1px solid #ddd; background:#fff; padding:6px 10px; border-radius:10px; cursor:pointer;
+    }
+    .btn:hover { background:#f6f6f6; }
   </style>
 </head>
 <body>
   <div id="map"></div>
-  <div class="topbar">
-    <div><strong>Patient Map</strong></div>
-    <div class="muted">Loading <code>data.csv</code>… (keep this file in the repo)</div>
+
+  <div class="panel">
+    <div style="font-weight:700;">Patient Map</div>
+    <div class="muted" id="status">Loading <code>data.csv</code>… (keep this file in the repo)</div>
+    <div class="error" id="err"></div>
+
+    <div class="legend">
+      <div class="chip" style="background:#2ecc71"></div><div>0–5 km</div>
+      <div class="chip" style="background:#f1c40f"></div><div>5–10 km</div>
+      <div class="chip" style="background:#e67e22"></div><div>10–20 km</div>
+      <div class="chip" style="background:#e74c3c"></div><div>20–50 km</div>
+      <div class="chip" style="background:#111"></div><div>50+ km</div>
+    </div>
+
+    <div class="controls">
+      <button class="btn" id="btn-fit">Fit to data</button>
+      <button class="btn" id="btn-center">Center on epicenter</button>
+    </div>
+    <div class="muted" style="margin-top:6px;">Drag the red star to move the epicenter.</div>
   </div>
 
   <script>
-  // ---------- CONFIG ----------
-  // CSV file path (same repo). Upload your CSV as data.csv.
+  // ======================== CONFIG ========================
   const CSV_PATH = 'data.csv';
 
-  // Candidate latitude/longitude column names:
-  const LAT_CANDIDATES = ['lat','latitude','Latitude','LAT','Unnamed: 14'];
-  const LON_CANDIDATES = ['lon','lng','longitude','Longitude','LON','Unnamed: 15'];
+  // Default epicenter (78 Corporate Dr)
+  const defaultEpicenter = [43.78029, -79.2509];
 
-  // Optional popup fields to show if present:
+  // Distance color buckets (km)
+  function colorForKm(km){
+    if (km <= 5)  return '#2ecc71';  // green
+    if (km <= 10) return '#f1c40f';  // yellow
+    if (km <= 20) return '#e67e22';  // orange
+    if (km <= 50) return '#e74c3c';  // red
+    return '#111111';                // black
+  }
+
+  // Fields to show if present
   const POPUP_FIELDS = [
-    ['Postal Codes', 'Postal Code'],
-    ['HDvsPDvsHHD', 'Type'],
-    ['Material Deprivation', 'Material Deprivation']
+    ['postal codes', 'Postal Code'],
+    ['hdvspdvshhd', 'Type'],
+    ['material deprivation', 'Material Deprivation']
   ];
 
-  // ---------- HELPERS ----------
-  function pickColumn(headerRow, candidates) {
-    for (const c of candidates) {
-      if (headerRow.includes(c)) return c;
-    }
-    return null;
-  }
+  // ======================== HELPERS ========================
+  function trimLower(s){ return (s==null?'':(''+s)).trim().toLowerCase(); }
+  function status(msg){ const el = document.getElementById('status'); if (el) el.textContent = msg; }
+  function showErr(msg){ const el = document.getElementById('err'); if (el) el.textContent = msg; }
 
-  function toNumber(x) {
-    if (x === null || x === undefined) return NaN;
+  function toNum(x){
+    if (x==null) return NaN;
     const t = (''+x).trim();
-    if (t === '' || t.toLowerCase() === 'nan' || t.toLowerCase() === 'null') return NaN;
-    return Number(t);
+    if (!t || t.toLowerCase()==='nan' || t.toLowerCase()==='null') return NaN;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : NaN;
   }
 
-  function buildPopup(row, latKey, lonKey) {
-    const lines = [];
-    for (const [key, label] of POPUP_FIELDS) {
-      if (row.hasOwnProperty(key)) {
-        const v = (''+(row[key] ?? '')).trim();
-        lines.push(`<div><b>${label}:</b> ${v || 'Not specified'}</div>`);
-      }
-    }
-    const lat = Number(row[latKey]);
-    const lon = Number(row[lonKey]);
-    lines.push(`<div><b>Latitude:</b> ${isFinite(lat) ? lat.toFixed(6) : ''}</div>`);
-    lines.push(`<div><b>Longitude:</b> ${isFinite(lon) ? lon.toFixed(6) : ''}</div>`);
-    return lines.join('');
+  // Haversine distance in km
+  function haversineKm(a, b){
+    const toRad = d => d * Math.PI/180;
+    const R = 6371; // km
+    const dLat = toRad(b[0]-a[0]);
+    const dLon = toRad(b[1]-a[1]);
+    const lat1 = toRad(a[0]);
+    const lat2 = toRad(b[0]);
+    const sinDLat = Math.sin(dLat/2), sinDLon = Math.sin(dLon/2);
+    const h = sinDLat*sinDLat + Math.cos(lat1)*Math.cos(lat2)*sinDLon*sinDLon;
+    return 2*R*Math.asin(Math.min(1, Math.sqrt(h)));
   }
 
-  // ---------- MAP ----------
+  // Make a small colored dot icon
+  function dotIcon(hex){
+    return L.divIcon({
+      className: 'dot',
+      html: `<div style="
+        width:14px;height:14px;border-radius:50%;
+        background:${hex};
+        box-shadow: inset 0 0 0 1px rgba(0,0,0,.25);
+      "></div>`,
+      iconSize: [14,14],
+      iconAnchor: [7,7],
+      popupAnchor: [0,-6]
+    });
+  }
+
+  // ======================== MAP ========================
   const map = L.map('map', { zoomControl: true }).setView([43.7, -79.4], 10);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19, attribution: '&copy; OpenStreetMap'
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap'
   }).addTo(map);
 
   const clusters = L.markerClusterGroup({ disableClusteringAtZoom: 16 });
   map.addLayer(clusters);
 
-  // ---------- LOAD CSV ----------
+  // Epicenter + rings
+  let epicenter = L.marker(defaultEpicenter, {
+    draggable: true,
+    title: 'Epicenter',
+    icon: L.divIcon({
+      className:'epicenter',
+      html: `<div style="font-size:20px;color:#d90429;transform:translate(-50%,-50%);">★</div>`,
+      iconSize: [20,20],
+      iconAnchor: [10,10]
+    })
+  }).addTo(map);
+
+  let rings = []; // store circles so we can redraw
+  function drawRings(center){
+    rings.forEach(c => map.removeLayer(c));
+    rings = [5,10,20,50].map(km =>
+      L.circle(center, {
+        radius: km*1000,
+        color: '#1f6feb',
+        weight: 1,
+        fill: false,
+        opacity: 0.6
+      }).addTo(map)
+    );
+  }
+  drawRings(epicenter.getLatLng());
+
+  document.getElementById('btn-center').onclick = () => {
+    map.setView(epicenter.getLatLng(), 12);
+  };
+
+  // ======================== LOAD CSV ========================
   Papa.parse(CSV_PATH, {
     download: true,
     header: true,
     dynamicTyping: false,
     skipEmptyLines: true,
+    transformHeader: h => h.replace(/^\uFEFF/, '').trim(), // strip BOM & trim
     complete: (results) => {
-      const rows = results.data;
-      if (!rows || !rows.length) {
-        alert('No data found in data.csv');
+      const rows = results.data || [];
+      if (!rows.length){ showErr('No rows found in data.csv'); return; }
+
+      const headers = results.meta.fields?.length ? results.meta.fields : Object.keys(rows[0]);
+      const headerNorm = new Map(headers.map(h => [h, trimLower(h)]));
+
+      // Find/Infer lat/lon keys
+      const LAT_CANDS = ['lat','latitude','unnamed: 14'];
+      const LON_CANDS = ['lon','lng','longitude','unnamed: 15'];
+      const findKey = (cands) => {
+        for (const [real, norm] of headerNorm.entries()){
+          if (cands.includes(norm)) return real;
+        }
+        return null;
+      };
+      let latKey = findKey(LAT_CANDS);
+      let lonKey = findKey(LON_CANDS);
+
+      if (!latKey || !lonKey){
+        // Fallback inference by range
+        let bestLat=null, bestLatScore=0, bestLon=null, bestLonScore=0;
+        const score = (key, lo, hi) => {
+          let nonNa=0, ok=0, maxCheck=0;
+          for (const r of rows){
+            const v = toNum(r[key]);
+            if (!Number.isNaN(v)){ nonNa++; if (v>=lo && v<=hi) ok++; }
+            if (++maxCheck>1000) break;
+          }
+          return nonNa ? ok/nonNa : 0;
+        };
+        for (const h of headers){
+          const sLat = score(h, -90, 90);
+          const sLon = score(h, -180, 180);
+          if (sLat > bestLatScore){ bestLat=h; bestLatScore=sLat; }
+          if (sLon > bestLonScore){ bestLon=h; bestLonScore=sLon; }
+        }
+        if (bestLatScore>=0.6 && bestLonScore>=0.6 && bestLat!==bestLon){
+          latKey = bestLat; lonKey = bestLon;
+          status(`Detected lat/lon automatically: "${latKey}" & "${lonKey}"`);
+        }
+      }
+
+      if (!latKey || !lonKey){
+        showErr('Could not detect latitude/longitude columns. Keep them as "Unnamed: 14/15" or rename to "Latitude/Longitude".');
         return;
       }
 
-      const headers = results.meta.fields || Object.keys(rows[0]);
-      const latKey = pickColumn(headers, LAT_CANDIDATES);
-      const lonKey = pickColumn(headers, LON_CANDIDATES);
-
-      if (!latKey || !lonKey) {
-        alert('Could not find latitude/longitude columns. ' +
-              'Expected one of: ' + LAT_CANDIDATES.join(', ') + ' / ' + LON_CANDIDATES.join(', '));
-        return;
-      }
-
-      const bounds = [];
+      // Build markers
+      const markers = [];
       let added = 0;
+      const bounds = [];
+
+      function buildPopup(row){
+        const lines = [];
+        for (const [want, label] of POPUP_FIELDS){
+          for (const [real, norm] of headerNorm.entries()){
+            if (norm === want){
+              const v = (row[real] ?? '').toString().trim();
+              lines.push(`<div><b>${label}:</b> ${v || 'Not specified'}</div>`);
+            }
+          }
+        }
+        return lines.join('');
+      }
 
       rows.forEach(row => {
-        const lat = toNumber(row[latKey]);
-        const lon = toNumber(row[lonKey]);
-        if (!isFinite(lat) || !isFinite(lon)) return;
+        const lat = toNum(row[latKey]);
+        const lon = toNum(row[lonKey]);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
         if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return;
 
-        const popupHtml = buildPopup(row, latKey, lonKey);
-        const marker = L.marker([lat, lon]);
-        marker.bindPopup(popupHtml, { maxWidth: 320 });
-        marker.bindTooltip((row['Postal Codes'] ?? 'Patient') + '', {direction:'top', sticky:true});
-        clusters.addLayer(marker);
+        const m = L.marker([lat, lon], { icon: dotIcon('#999') });
+        m.bindPopup(buildPopup(row), { maxWidth: 320 });
+        const tip = (row['Postal Codes'] ?? row['postal codes'] ?? 'Patient') + '';
+        m.bindTooltip(tip, { direction: 'top', sticky: true });
+
+        markers.push(m);
+        clusters.addLayer(m);
         bounds.push([lat, lon]);
         added++;
       });
 
-      if (bounds.length) map.fitBounds(bounds, { padding: [30, 30] });
+      if (bounds.length) map.fitBounds(bounds, { padding: [30,30] });
+      status(`Loaded ${added.toLocaleString()} points from data.csv`);
 
-      // Update banner text
-      const muted = document.querySelector('.muted');
-      if (muted) muted.textContent = `Loaded ${added.toLocaleString()} points from data.csv`;
+      // ---- Recolor markers by distance from epicenter ----
+      function recolorAll(){
+        const c = epicenter.getLatLng();
+        const center = [c.lat, c.lng];
+        markers.forEach(m => {
+          const ll = m.getLatLng();
+          const km = haversineKm(center, [ll.lat, ll.lng]);
+          m.setIcon(dotIcon(colorForKm(km)));
+          // Optional: show distance in popup footer
+          // Leave popup content as-is for speed
+        });
+        drawRings(epicenter.getLatLng());
+      }
+      recolorAll();
+
+      epicenter.on('dragend', () => {
+        recolorAll();
+      });
+
+      document.getElementById('btn-fit').onclick = () => {
+        if (bounds.length) map.fitBounds(bounds, { padding:[30,30] });
+      };
     },
     error: (err) => {
       console.error(err);
-      alert('Error loading data.csv: ' + (err && err.message ? err.message : err));
+      showErr('Error loading data.csv: ' + (err && err.message ? err.message : err));
     }
   });
   </script>
