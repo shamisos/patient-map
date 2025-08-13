@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Patient Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Leaflet + MarkerCluster (CDN) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+  <!-- PapaParse to read CSV in the browser -->
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .topbar {
+      position: absolute; z-index: 1000; left: 10px; top: 10px;
+      background: white; padding: 10px 12px; border-radius: 10px;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.15); font: 14px/1.3 system-ui, sans-serif;
+    }
+    .muted { color: #666; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="topbar">
+    <div><strong>Patient Map</strong></div>
+    <div class="muted">Loading <code>data.csv</code>… (keep this file in the repo)</div>
+  </div>
+
+  <script>
+  // ---------- CONFIG ----------
+  // CSV file path (same repo). Upload your CSV as data.csv.
+  const CSV_PATH = 'data.csv';
+
+  // Candidate latitude/longitude column names:
+  const LAT_CANDIDATES = ['lat','latitude','Latitude','LAT','Unnamed: 14'];
+  const LON_CANDIDATES = ['lon','lng','longitude','Longitude','LON','Unnamed: 15'];
+
+  // Optional popup fields to show if present:
+  const POPUP_FIELDS = [
+    ['Postal Codes', 'Postal Code'],
+    ['HDvsPDvsHHD', 'Type'],
+    ['Material Deprivation', 'Material Deprivation']
+  ];
+
+  // ---------- HELPERS ----------
+  function pickColumn(headerRow, candidates) {
+    for (const c of candidates) {
+      if (headerRow.includes(c)) return c;
+    }
+    return null;
+  }
+
+  function toNumber(x) {
+    if (x === null || x === undefined) return NaN;
+    const t = (''+x).trim();
+    if (t === '' || t.toLowerCase() === 'nan' || t.toLowerCase() === 'null') return NaN;
+    return Number(t);
+  }
+
+  function buildPopup(row, latKey, lonKey) {
+    const lines = [];
+    for (const [key, label] of POPUP_FIELDS) {
+      if (row.hasOwnProperty(key)) {
+        const v = (''+(row[key] ?? '')).trim();
+        lines.push(`<div><b>${label}:</b> ${v || 'Not specified'}</div>`);
+      }
+    }
+    const lat = Number(row[latKey]);
+    const lon = Number(row[lonKey]);
+    lines.push(`<div><b>Latitude:</b> ${isFinite(lat) ? lat.toFixed(6) : ''}</div>`);
+    lines.push(`<div><b>Longitude:</b> ${isFinite(lon) ? lon.toFixed(6) : ''}</div>`);
+    return lines.join('');
+  }
+
+  // ---------- MAP ----------
+  const map = L.map('map', { zoomControl: true }).setView([43.7, -79.4], 10);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  const clusters = L.markerClusterGroup({ disableClusteringAtZoom: 16 });
+  map.addLayer(clusters);
+
+  // ---------- LOAD CSV ----------
+  Papa.parse(CSV_PATH, {
+    download: true,
+    header: true,
+    dynamicTyping: false,
+    skipEmptyLines: true,
+    complete: (results) => {
+      const rows = results.data;
+      if (!rows || !rows.length) {
+        alert('No data found in data.csv');
+        return;
+      }
+
+      const headers = results.meta.fields || Object.keys(rows[0]);
+      const latKey = pickColumn(headers, LAT_CANDIDATES);
+      const lonKey = pickColumn(headers, LON_CANDIDATES);
+
+      if (!latKey || !lonKey) {
+        alert('Could not find latitude/longitude columns. ' +
+              'Expected one of: ' + LAT_CANDIDATES.join(', ') + ' / ' + LON_CANDIDATES.join(', '));
+        return;
+      }
+
+      const bounds = [];
+      let added = 0;
+
+      rows.forEach(row => {
+        const lat = toNumber(row[latKey]);
+        const lon = toNumber(row[lonKey]);
+        if (!isFinite(lat) || !isFinite(lon)) return;
+        if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return;
+
+        const popupHtml = buildPopup(row, latKey, lonKey);
+        const marker = L.marker([lat, lon]);
+        marker.bindPopup(popupHtml, { maxWidth: 320 });
+        marker.bindTooltip((row['Postal Codes'] ?? 'Patient') + '', {direction:'top', sticky:true});
+        clusters.addLayer(marker);
+        bounds.push([lat, lon]);
+        added++;
+      });
+
+      if (bounds.length) map.fitBounds(bounds, { padding: [30, 30] });
+
+      // Update banner text
+      const muted = document.querySelector('.muted');
+      if (muted) muted.textContent = `Loaded ${added.toLocaleString()} points from data.csv`;
+    },
+    error: (err) => {
+      console.error(err);
+      alert('Error loading data.csv: ' + (err && err.message ? err.message : err));
+    }
+  });
+  </script>
+</body>
+</html>
